@@ -1,75 +1,82 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import time
+import logging
+
+# Configuração de Log para monitorar erros no Render
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
-# ESTRUTURA DE DADOS: { "NOME_DO_CLIENTE": { "MAGIC_ID": { "dados_da_ordem" } } }
-# Isso garante que cada robô tenha apenas UMA linha por cliente.
+# Banco de dados em memória (Snapshot por Bloco)
+# Estrutura: { "NOME_MASTER": { "MAGIC_ID": { "dados" } } }
 db_snapshots = {}
+# Registro de atividade dos clientes para o painel ON/OFF
+active_clients = {}
 
 @app.route('/')
-def home():
-    return "Titanium API - Sistema de Blocos Ativo", 200
+def health_check():
+    return "<h1>Titanium API v41.0 - Online</h1>", 200
 
-# --- ROTA DO MASTER (ENVIA OS DADOS) ---
 @app.route('/sync-master', methods=['POST'])
 def sync_master():
     try:
         data = request.json
-        client_name = data.get('client_name', 'MASTER_DEFAULT')
-        magic = str(data.get('magic'))
-        
-        # Se o cliente não existe no "banco", cria o bloco dele
-        if client_name not in db_snapshots:
-            db_snapshots[client_name] = {}
+        if not data:
+            return jsonify({"status": "error", "message": "No data"}), 400
             
-        # Grava ou SOBRESCREVE o bloco do Magic específico
-        # Se o volume for 0, nós removemos do bloco para limpar o lixo
+        master_name = data.get('client_name', 'DEFAULT_MASTER')
+        magic = str(data.get('magic'))
         volume = float(data.get('volume', 0))
+        
+        if master_name not in db_snapshots:
+            db_snapshots[master_name] = {}
+        
+        # LÓGICA DE BLOCO: Se volume é 0, removemos o bloco para não virar "lixo"
         if volume <= 0:
-            if magic in db_snapshots[client_name]:
-                del db_snapshots[client_name][magic]
+            db_snapshots[master_name].pop(magic, None)
         else:
-            db_snapshots[client_name][magic] = {
+            db_snapshots[master_name][magic] = {
                 "magic": int(magic),
                 "type": data.get('type'),
                 "volume": volume,
                 "price": data.get('price', 0),
-                "session": int(time.time()) # Marca o tempo exato da escrita
+                "session": int(time.time())
             }
-            
-        return jsonify({"status": "success", "message": f"Bloco {magic} atualizado"}), 200
+        
+        # Retorna a lista de clientes que pediram dados desse master nos últimos 30s
+        clients_on = [c for c, t in active_clients.items() if t > (time.time() - 30)]
+        return jsonify({"status": "success", "active_clients": clients_on}), 200
+
     except Exception as e:
+        logger.error(f"Master Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 400
 
-# --- ROTA DO RECEPTOR (LÊ OS DADOS) ---
 @app.route('/sync-client', methods=['POST'])
 def sync_client():
     try:
         data = request.json
-        target_master = data.get('target_master', 'DIEGO_MASTER') # Qual master ele deve seguir
-        agora = int(time.time())
+        client_name = data.get('client_name', 'UNKNOWN_CLIENT')
+        target_master = data.get('target_master', 'DIEGO_MASTER')
+        
+        # Registra que o cliente está online
+        active_clients[client_name] = time.time()
         
         if target_master not in db_snapshots:
             return jsonify([]), 200
             
-        # FILTRO DE SEGURANÇA: Só envia o que foi atualizado nos últimos 60 segundos
-        # Isso mata as "ordens fantasmas" que ficam presas no cache
-        current_state = []
-        for magic, info in db_snapshots[target_master].items():
-            if info['session'] > (agora - 60):
-                current_state.append(info)
+        # Filtra apenas blocos atualizados no último minuto (Anti-Fantasma)
+        agora = int(time.time())
+        snapshot = [
+            info for magic, info in db_snapshots[target_master].items() 
+            if info['session'] > (agora - 60)
+        ]
         
-        return jsonify(current_state), 200
+        return jsonify(snapshot), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
-
-# --- ROTA DE MONITORAMENTO (PARA VOCÊ VER NO NAVEGADOR) ---
-@app.route('/dashboard', methods=['GET'])
-def dashboard():
-    return jsonify(db_snapshots), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
