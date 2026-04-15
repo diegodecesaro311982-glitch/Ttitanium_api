@@ -1,98 +1,80 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import os
+from flask import Flask, request, jsonify
 import time
-import logging
+import threading
 
-# Configuração de Log para você ver tudo o que acontece no Render
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("TitaniumServer")
+app = Flask(__name__)
 
-app = FastAPI(title="Titanium Copy Engine V4")
+# --- BANCO DE DADOS EM MEMÓRIA (ALTA PERFORMANCE) ---
+# Estrutura: { "60561": "TK1:B:0.1|TK2:B:0.1", "63370": "EMPTY" }
+titanium_db = {
+    "orders": {},
+    "clients": {},  # { "nome_cliente": timestamp }
+    "master_last_seen": 0
+}
 
-# Permite conexões de qualquer lugar
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Lock para evitar conflitos de leitura/escrita simultânea (Preço Médio rápido)
+db_lock = threading.Lock()
 
-# --- BANCO DE DADOS EM MEMÓRIA (GAVETAS) ---
-class TitaniumDB:
-    def __init__(self):
-        self.magics = {}   # Armazena volume, tipo e preço médio de cada Magic
-        self.clients = {}  # Monitora o status de cada receptor
-        self.master_status = "OFFLINE"
-        self.last_master_update = 0
+@app.route('/')
+def health_check():
+    return "Titanium Brain V1.3 - Online", 200
 
-db = TitaniumDB()
+@app.route('/sync', methods=['POST'])
+def sync_protocol():
+    global titanium_db
+    data = request.json
+    now = time.time()
 
-@app.get("/")
-async def health_check():
-    agora = time.time()
-    receptores_vivos = {name: f"{int(agora - ts)}s atrás" for name, ts in db.clients.items() if agora - ts < 60}
-    return {
-        "engine": "Titanium V4",
-        "status": "Online",
-        "master_last_seen": f"{int(agora - db.last_master_update)}s atrás" if db.last_master_update > 0 else "Nunca",
-        "magics_na_gaveta": db.magics,
-        "receptores_online": receptores_vivos
-    }
+    if not data:
+        return jsonify({"error": "No data received"}), 400
 
-@app.post("/sync-master")
-async def sync_master(request: Request):
-    try:
-        data = await request.json()
-        magic_id = str(data.get("magic"))
+    # --- IDENTIFICAÇÃO DO COMANDANTE (MASTER) ---
+    if 'm' in data:
+        with db_lock:
+            titanium_db["master_last_seen"] = now
+            # Atualiza cada Magic Number enviado (Hedge/Médio)
+            # Esperado: [{"id": 60561, "l": "..."}, {"id": 63370, "l": "..."}]
+            for entry in data.get('d', []):
+                m_id = str(entry.get('id'))
+                titanium_db["orders"][m_id] = entry.get('l', 'EMPTY')
+
+            # Filtra apenas clientes que deram sinal nos últimos 15 segundos
+            active_clients = [
+                name for name, last_seen in titanium_db["clients"].items() 
+                if (now - last_seen) < 15
+            ]
         
-        if not magic_id:
-            raise HTTPException(status_code=400, detail="Magic ID ausente")
+        # O Master recebe a lista de nomes para o painel do MT5
+        return ",".join(active_clients), 200
 
-        # Atualiza a Gaveta com precisão
-        db.magics[magic_id] = {
-            "type": data.get("type", "NONE"),
-            "volume": float(data.get("volume", 0.0)),
-            "price": float(data.get("price", 0.0)), # Caso queira expandir para preço depois
-            "last_update": time.time()
-        }
+    # --- IDENTIFICAÇÃO DO RECEPTOR (CLIENT) ---
+    if 'client' in data:
+        c_name = data.get('client')
+        with db_lock:
+            titanium_db["clients"][c_name] = now
+            # O Receptor puxa o estado atual de todos os Magics
+            current_orders = titanium_db["orders"]
         
-        db.last_master_update = time.time()
-        db.master_status = "ONLINE"
+        return jsonify(current_orders), 200
 
-        # Coleta Receptores Ativos para devolver ao Master
-        agora = time.time()
-        ativos = [{"client_name": n} for n, ts in db.clients.items() if agora - ts < 30]
-        
-        return {
-            "status": "success",
-            "active_receptors": ativos,
-            "server_time": agora
-        }
-    except Exception as e:
-        logger.error(f"Erro no Master: {e}")
-        return {"status": "error", "message": str(e)}
+    return "Invalid Protocol", 400
 
-@app.post("/sync-client")
-async def sync_client(request: Request):
-    try:
-        data = await request.json()
-        nome_cliente = data.get("client_name", "REC_DESCONHECIDO")
-        
-        # Registra presença do Receptor
-        db.clients[nome_cliente] = time.time()
-        
-        # O Receptor recebe a foto atual de TODAS as gavetas
-        # Isso permite que ele ajuste todos os magics de uma vez só
-        return db.magics
-        
-    except Exception as e:
-        logger.error(f"Erro no Cliente {data.get('client_name')}: {e}")
-        return {"status": "error", "message": str(e)}
+# --- LIMPEZA AUTOMÁTICA DE MEMÓRIA (OPCIONAL/ROBUSTEZ) ---
+def auto_cleanup():
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with db_lock:
+            # Remove clientes offline há mais de 5 minutos para não pesar
+            expired = [n for n, t in titanium_db["clients"].items() if (now - t) > 300]
+            for n in expired:
+                del titanium_db["clients"][n]
 
-if __name__ == "__main__":
-    # Porta dinâmica para o Render
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"Iniciando Titanium Engine na porta {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+# Inicia a limpeza em uma thread separada para não travar a latência
+threading.Thread(target=auto_cleanup, daemon=True).start()
+
+if __name__ == '__main__':
+    # O Render usa a porta da variável de ambiente PORT
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
